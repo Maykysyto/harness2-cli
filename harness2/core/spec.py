@@ -98,6 +98,7 @@ INSTALL_MODES = (
     "workspace_config",
     "codex_root",
     "claude_root",
+    "pi_root",
     "command_files",
 )
 
