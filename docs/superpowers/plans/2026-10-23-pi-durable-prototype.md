@@ -75,3 +75,13 @@
 - [ ] Implement CLI and docs.
 - [ ] Run the Python core and plugin suites, Ruff check/format, Node host tests and one live smoke if possible.
 - [ ] Commit.
+
+## Review amendments to task contracts
+
+Task 1 stores the Pi runtime version and extension fingerprint in the descriptor and reuses a settled submission to rebuild `result.json` after a host crash. It must reject an empty answer.
+
+Task 2's identity uses a stable slot independent of temporary paths plus the immutable model/effort/runtime/prompt/system/context/harness fingerprint. The process lock begins before preparation and is inherited by Node. A different fingerprint or concurrent owner fails closed.
+
+Task 3 records workspace preparation before launching Pi, keeps incomplete workspaces (including timeout/quota), and raises a recoverable stop instead of writing a completion marker. It gives judge runs their own stable context/audit directory and tests all roles.
+
+Task 4 documents that arbitrary Pi CLI extensions and MCP servers are outside the prototype. The final gate includes separate-process crash/restart tests and checks events for no double count.

@@ -38,3 +38,17 @@ Only one host process may own a session database at a time. The Python launcher 
 - Keep one Durable database per model-backed call. This simplifies ownership and resume, but creates many small databases; later consolidation can change storage without changing call identity.
 - Limit the first surface to instructions and skills. This gives a useful Pi harness without unsafe automatic loading of arbitrary extensions, but cannot optimize Pi CLI-specific hooks/MCP until a later contract defines them.
 - Use the Pi SDK credential runtime, not a custom token store. This ties the prototype to Pi 1.4.0 APIs, which the package labels experimental.
+
+## Architecture review amendments
+
+The independent review found seven integration risks. The following contracts resolve them for this prototype:
+
+- A Pi call's identity is its stable run-relative slot (role/task/candidate/sample) plus an immutable request fingerprint. Model, effort, Pi runtime version, prompt, system instructions, initial context digest and harness digest are in that fingerprint. An incomplete workspace's later edits do not alter identity. A mismatch fails closed.
+- Before invoking Pi, Harness² writes a preparation manifest with initial context digest, baseline commit for project workspaces, and descriptor fingerprint. On resume it reuses that workspace exactly; it never reinstalls the harness or copies context over the mutated workspace. If preparation has no manifest and no Pi database, it may be recreated.
+- A Pi timeout, lost host, blocked task or other nonterminal condition raises a recoverable stop through the orchestrator. It does not produce a final `meta.json`, `.adapt_complete`, judge result or fallback choice. A completed Durable submission can regenerate missing Harness² artifacts on the next call.
+- The same file lock covers preparation, Node execution and export. The lock descriptor is inherited by the Node child, so a surviving child keeps ownership if Python exits. The next process waits for release or returns a clear busy result; it never opens SQLite concurrently.
+- The judge's context and audit directory are stable inside its rollout directory. All roles use the same Pi transport, and all Pi sessions retain their database and transcript. A host result with an empty answer is a terminal error, not a valid candidate.
+- `CodingTools` and Code Mode are installed in a fixed order before `resume()`. Code Mode uses the same Pi 1.4.0 sandbox implementation after restart. Tools with uncertain external effects use their default replay policy; recovery reports uncertainty rather than creating a new submission.
+- The prototype's deterministic tests use separated processes for recovery and duplicate ownership. A live model smoke is additional evidence, not a replacement for those tests.
+
+The review found no previously recorded ruling to contradict. These amendments supersede the shorter statements above where more precise.
