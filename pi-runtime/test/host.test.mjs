@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
@@ -93,6 +95,49 @@ test('Durable host loads the staged Pi instructions and skill index', async () =
     await rm(join(dir, 'result.json'));
     await runDescriptor(path, { models });
     assert.equal(await readFile(join(dir, 'effective-system.txt'), 'utf8'), frozen);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a process killed after settlement resumes without a second model response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'h2-pi-kill-'));
+  try {
+    const descriptor = {
+      version: 1, slot: 'role/selector', fingerprint: 'kill-request',
+      requestId: 'h2-kill-one', sessionDir: dir, cwd: dir,
+      model: 'faux/faux-1', effort: 'low', system: '', prompt: 'Say ONE.',
+    };
+    const path = join(dir, 'request.json');
+    await writeFile(path, JSON.stringify(descriptor));
+    const hostUrl = pathToFileURL(join(import.meta.dirname, '../host.mjs')).href;
+    const source = `
+      import { writeFile } from 'node:fs/promises';
+      import { createModels } from '@earendil-works/pi-ai/models';
+      import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux';
+      const { runDescriptor } = await import(${JSON.stringify(hostUrl)});
+      const faux = fauxProvider();
+      faux.setResponses([fauxAssistantMessage(process.env.CRASH ? 'ONE' : 'TWO')]);
+      const models = createModels();
+      models.setProvider(faux.provider);
+      const result = await runDescriptor(${JSON.stringify(path)}, {
+        models,
+        afterSettled: process.env.CRASH ? () => process.kill(process.pid, 'SIGKILL') : undefined,
+      });
+      await writeFile(${JSON.stringify(join(dir, 'child-result.json'))},
+        JSON.stringify({ answer: result.answer, pending: faux.getPendingResponseCount() }));
+    `;
+    const first = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+      cwd: join(import.meta.dirname, '..'), env: { ...process.env, CRASH: '1' }, timeout: 10000,
+    });
+    assert.equal(first.signal, 'SIGKILL', first.stderr?.toString());
+    await assert.rejects(readFile(join(dir, 'result.json')));
+    const second = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+      cwd: join(import.meta.dirname, '..'), env: { ...process.env, CRASH: '' }, timeout: 10000,
+    });
+    assert.equal(second.status, 0, second.stderr?.toString());
+    const result = JSON.parse(await readFile(join(dir, 'child-result.json'), 'utf8'));
+    assert.deepEqual(result, { answer: 'ONE', pending: 1 });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

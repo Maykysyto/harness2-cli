@@ -32,6 +32,7 @@ from ..core import tree as HT
 MODELS = {
     "claude": ("claude-sonnet-5-5", "claude-opus-5-5"),
     "codex": ("gpt-6.1-sol", "gpt-6.1-sol"),
+    "pi": ("openai/gpt-6.1-sol", "openai/gpt-6.1-sol"),
 }
 # executor/channel -> (subscription provider, API-key provider)
 PROVIDERS = {"claude": ("claude-login", "anthropic"), "codex": ("chatgpt-login", "openai")}
@@ -81,7 +82,9 @@ def add_parser(sub) -> argparse.ArgumentParser:
     )
     p.add_argument("--yes", "-y", action="store_true", help="take every default, ask nothing")
     p.add_argument("--force", action="store_true", help="overwrite an existing config file")
-    p.add_argument("--executor", choices=("claude", "codex", "command"), help="skip that question")
+    p.add_argument(
+        "--executor", choices=("claude", "codex", "pi", "command"), help="skip that question"
+    )
     p.add_argument(
         "--auth",
         choices=("login", "api-key"),
@@ -110,12 +113,15 @@ def _run(args) -> tuple[int, dict]:
     print(f"Setting up Harness² in {root}")
 
     interactive = not args.yes and sys.stdin.isatty()
-    found = {name: _version(name) for name in ("claude", "codex")}
-    default = next((name for name in ("claude", "codex") if found[name]), None)
+    found = {name: _version(name) for name in ("claude", "codex", "node")}
+    default = next(
+        (name for name in ("claude", "codex", "pi") if found["node" if name == "pi" else name]),
+        None,
+    )
     executor = args.executor or (_pick_executor(ask, found, default) if interactive else default)
     if executor is None:
         message = (
-            "Neither Claude Code (`claude`) nor Codex (`codex`) is on PATH. Install one, or "
+            "Neither Claude Code (`claude`), Codex (`codex`) nor Node for Pi is on PATH. Install one, or "
             "rerun with --executor command to drive your own agent."
         )
         print(message, file=sys.stderr)
@@ -131,9 +137,17 @@ def _run(args) -> tuple[int, dict]:
         channel = "claude" if found["claude"] else "codex"
     else:
         channel = executor
-    auth = args.auth or (_pick_auth(ask, channel) if interactive else "login")
-    provider = PROVIDERS[channel][auth != "login"]
-    model, improver = (f"{provider}/{m}" for m in MODELS[channel])
+    if channel == "pi":
+        if args.auth == "api-key":
+            message = "Pi credentials belong in PI_CODING_AGENT_DIR; use --auth login"
+            print(message, file=sys.stderr)
+            return 1, {"error": message, "exit_code": 1}
+        auth = "login"
+        model, improver = MODELS["pi"]
+    else:
+        auth = args.auth or (_pick_auth(ask, channel) if interactive else "login")
+        provider = PROVIDERS[channel][auth != "login"]
+        model, improver = (f"{provider}/{m}" for m in MODELS[channel])
     if executor == "command":
         model = ""
     if executor != "command":
@@ -160,7 +174,10 @@ def _run(args) -> tuple[int, dict]:
     (config.parent / "tasks").mkdir(exist_ok=True)
 
     print(_harness_summary(root / harness, executor, editable))
-    print(_key_summary(root, (model, improver)))
+    if executor == "pi":
+        print("Pi reads credentials from PI_CODING_AGENT_DIR; install pi-runtime with npm ci.")
+    else:
+        print(_key_summary(root, (model, improver)))
     print(f"\nWrote {config.relative_to(root)}")
     if executor == "command" and not (command_lines and editable):
         print("Fill in executor.command and executor.editable before the first run.")
@@ -206,12 +223,14 @@ def _version(binary: str) -> str:
 
 
 def _pick_executor(ask, found: dict[str, str], default: str | None) -> str | None:
-    options = ["claude", "codex", "command"]
+    options = ["claude", "codex", "pi", "command"]
     if default is None:
         return None
     print("Which agent should run your tasks?")
     for i, name in enumerate(options, 1):
-        detail = found.get(name) or ("not found" if name != "command" else "your own command")
+        detail = found.get("node" if name == "pi" else name) or (
+            "not found" if name != "command" else "your own command"
+        )
         print(f"  {i}) {name:<8} {detail}")
     while True:
         answer = ask("Choose", str(options.index(default) + 1))
@@ -229,8 +248,15 @@ def _harness_summary(where: Path, executor: str, editable: list[str]) -> str:
         return f"Harness: {len(found)} editable file(s) under {where}."
     from ..substrate.claude import ClaudeSubstrate
     from ..substrate.codex import CodexSubstrate
+    from ..substrate.pi import PiSubstrate
 
-    sub = ClaudeSubstrate() if executor == "claude" else CodexSubstrate()
+    sub = (
+        ClaudeSubstrate()
+        if executor == "claude"
+        else PiSubstrate()
+        if executor == "pi"
+        else CodexSubstrate()
+    )
     tree = sub.import_tree(where)
     surface = sub.surface()
     always = surface.always_on[0]

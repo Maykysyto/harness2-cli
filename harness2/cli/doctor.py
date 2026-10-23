@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 
 from .. import providers, registry
 from ..core.proposer import Proposer
 from ..core.spec import ChannelSpec
+from ..pi_runtime import pi_preflight
 from ..substrate._native import cli_argv
 from . import _common as C
 
@@ -73,8 +75,9 @@ def run(args, ctx) -> int:
 
             def resolve(model=model, channel=channel, role=role):
                 provider_name, bare = providers.split_model(model)
-                provider = config.provider(provider_name)
-                referenced.add(provider_name)
+                provider = None if channel == "pi" else config.provider(provider_name)
+                if channel != "pi":
+                    referenced.add(provider_name)
                 # each raises ConfigError when this CLI cannot use this kind of provider
                 if channel == "claude":
                     providers.claude_env(provider)
@@ -110,6 +113,8 @@ def run(args, ctx) -> int:
     for binary, channel in sorted(binaries):
 
         def binary_check(binary=binary, channel=channel):
+            if channel == "pi":
+                return pi_preflight(binary or "node")
             argv = cli_argv(binary, channel)
             result = subprocess.run(
                 [*argv, "--version"], check=True, capture_output=True, text=True, timeout=10
@@ -148,7 +153,11 @@ def run(args, ctx) -> int:
 
             def live_check(spec=spec):
                 with ctx.progress():
-                    reply = Proposer(spec).call('Reply "ok".', None, "doctor.live")
+                    audit = None
+                    if spec.kind == "pi":
+                        digest = hashlib.sha256(spec.model.encode()).hexdigest()[:16]
+                        audit = ctx.project / ".harness2/pi-doctor" / digest
+                    reply = Proposer(spec, audit_dir=audit).call('Reply "ok".', None, "doctor.live")
                 if not reply.ok or reply.text.strip().lower() != "ok":
                     raise RuntimeError(reply.error or "expected reply ok")
                 return reply.text

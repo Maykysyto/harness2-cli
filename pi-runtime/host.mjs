@@ -95,7 +95,7 @@ async function modelsFromPi() {
   });
 }
 
-export async function runDescriptor(path, { models } = {}) {
+export async function runDescriptor(path, { models, afterSettled } = {}) {
   const descriptor = assertDescriptor(JSON.parse(await readFile(path, 'utf8')), path);
   const resultPath = join(descriptor.sessionDir, 'result.json');
   let prior;
@@ -138,6 +138,7 @@ export async function runDescriptor(path, { models } = {}) {
     }
     const answer = assistantText(await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), CONTEXT));
     if (!answer.trim()) throw new Error(`Pi submission ${submission.id} returned an empty answer`);
+    if (afterSettled) await afterSettled();
     const result = {
       version: 1, slot: descriptor.slot, fingerprint: descriptor.fingerprint,
       requestId: descriptor.requestId, submissionId: submission.id,

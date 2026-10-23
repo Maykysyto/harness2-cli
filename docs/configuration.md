@@ -44,6 +44,31 @@ parse as TOML is taken as a plain string: `-c executor.model=openai/gpt-6.1-sol`
 Every model is written `provider/model`. The provider part names a `[providers.<name>]`
 table, which says what kind of endpoint it is and how it is reached.
 
+### Pi Durable prototype
+
+With `executor.name = "pi"` or a role's `channel = "pi"`, the model is a Pi runtime ID,
+such as `openai/gpt-6.1-sol`. Pi resolves credentials from `PI_CODING_AGENT_DIR` (default
+`~/.pi/agent`), not from Harness²'s `[providers]` table. The directory must contain Pi's
+`auth.json`; keep it outside the project and run artifacts. Install pinned Pi 1.4.0 packages
+with `npm ci --prefix pi-runtime` from a source checkout. `harness2 doctor` checks the
+installed runtime, Node 22.19+ and the auth file without making a model request;
+`doctor --live` sends a small request.
+
+The Pi SDK host registers coding tools and Code Mode for every session. It reads the
+candidate harness's `AGENTS.md` and the descriptions of `.agents/skills/*/SKILL.md` as
+instructions, and exposes the workspace files to the agent. It does not automatically
+load Pi CLI extensions, MCP servers or personal hooks. The Node host is an opt-in source
+checkout component; a plain PyPI-style Python install does not include its npm dependencies.
+
+Each task rollout stores its prepared workspace, `pi-prepared.json`, the Pi session database
+and a request descriptor below its run directory. Role calls keep a working directory and
+session database in their audit directory. Rerun the same `harness2 run` command to resume
+an incomplete call. Changing its model, effort, prompt, task inputs or harness while it is
+incomplete is rejected; inspect or finish the old call before starting different inputs.
+An interrupted external tool effect can be uncertain even when the submission is resumed:
+review the workspace and Pi trajectory before repeating an external action manually.
+Pi's current cost field is zero, so use `--max-calls` rather than `--budget-usd` to cap it.
+
 ### Subscriptions
 
 Two built-in providers use the login your installed CLI already has, so a subscription is
@@ -154,9 +179,9 @@ it.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `name` | `"claude"` | `claude`, `codex` or `command`. Plugin suites accept their own executors (the benchmark plugin uses `opencode` and `codex`). |
-| `model` | `""` | `provider/model` the executor runs on. Required for `claude` and `codex`. |
-| `bin` | `""` | Binary or command to start the CLI. Empty means the executor name on `PATH`. |
+| `name` | `"claude"` | `claude`, `codex`, `pi` or `command`. Plugin suites accept their own executors (the benchmark plugin uses `opencode` and `codex`). |
+| `model` | `""` | `provider/model` the executor runs on. Required for `claude`, `codex` and `pi`. |
+| `bin` | `""` | CLI binary or command; for Pi, a Node binary path. Empty uses `node` for Pi. |
 | `effort` | `"high"` | Reasoning effort passed to the CLI. |
 | `timeout` | `1800` | Seconds one rollout may take. A task's `timeout` overrides it. |
 | `command` | `""` | `command` executor only: the shell command that runs one task. `{workspace}`, `{prompt_file}` and `{output}` are replaced with quoted paths. |
@@ -174,7 +199,7 @@ person.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `channel` | `"claude"` | Which CLI runs the session: `claude`, `codex` or `opencode`. `[selector]` also accepts `human`. |
+| `channel` | `"claude"` | `claude`, `codex`, `opencode` or Pi SDK (`pi`). `[selector]` also accepts `human`. |
 | `model` | `""` | `provider/model`. Required for the improver. |
 | `bin` | `""` | Binary or command for the channel's CLI. |
 | `effort` | `"high"` | Reasoning effort. |

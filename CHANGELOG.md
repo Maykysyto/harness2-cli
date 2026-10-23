@@ -12,6 +12,9 @@ The first release of Harness² CLI, a general-purpose version of
 
 ### Added
 
+- Opt-in Pi Durable 1.4.0 SDK prototype with Code Mode for the built-in tasks suite and
+  all model roles, plus persistent SQLite sessions and resumable Pi workspaces.
+
 - One `harness2` command with subcommands: `init`, `doctor`, `task`, `run`, `status`,
   `stop`, `diff`, `eval`, `apply`, `judge`, `report`, `runs`, `config`, `chat`, `guide`, `login`,
   `setup`, `demo`, `bridge`, `completion`.

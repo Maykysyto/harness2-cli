@@ -844,14 +844,16 @@ def check(ctx: SuiteContext) -> list[str]:
     problems = []
     settings = ctx.settings
     executor = settings.get("executor.name")
-    if executor not in ("claude", "codex", "command"):
-        problems.append("the tasks suite runs on claude, codex or command")
-    elif executor != "command":
+    if executor not in ("claude", "codex", "pi", "command"):
+        problems.append("the tasks suite runs on claude, codex, pi or command")
+    elif executor not in ("command", "pi"):
         try:
             cli_argv(settings.get("executor.bin"), executor)
         except ConfigError as exc:
             problems.append(str(exc))
-    elif not settings.get("executor.command") or not settings.get("executor.editable"):
+    elif executor == "command" and (
+        not settings.get("executor.command") or not settings.get("executor.editable")
+    ):
         problems.append("command executor needs executor.command and non-empty executor.editable")
     for role in ("executor", "improver", "selector", "reflector", "judge"):
         if role == "executor":
@@ -870,7 +872,8 @@ def check(ctx: SuiteContext) -> list[str]:
             if role != "executor":
                 _channel(settings, role)
             provider_name, _ = providers.split_model(values["model"])
-            problems.extend(providers.check(settings.provider(provider_name)))
+            if kind != "pi":
+                problems.extend(providers.check(settings.provider(provider_name)))
         except ConfigError as exc:
             problems.append(f"{role}: {exc}")
     tasks_dir = settings.path("paths.tasks")

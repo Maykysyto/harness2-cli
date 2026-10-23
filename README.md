@@ -28,6 +28,7 @@ lists the differences; the paper's benchmark setup lives on as a
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Pi Durable prototype](#pi-durable-prototype)
 - [Driving it from an agent](#driving-it-from-an-agent)
 - [Commands](#commands)
 - [Configuration](#configuration)
@@ -109,6 +110,28 @@ harness2 apply                         # review the changes and write them into 
 Running `harness2 run` again resumes an interrupted or limited run and reuses every finished
 step. Write a few varied tasks that look like the work you really do: see
 [Tasks](docs/tasks.md).
+
+## Pi Durable prototype
+
+The opt-in Pi path runs the built-in tasks suite through Pi's SDK runtime. Pi handles task
+rollouts, improver, selector, reflector and rubric judge calls; Code Mode is available in
+each session. Each call has its own Pi Durable SQLite database under the run's audit files.
+An interrupted Pi call resumes with the same request ID and workspace when the same command
+is run again. In the checkout containing this prototype:
+
+```bash
+python -m pip install -e .
+npm ci --prefix pi-runtime              # Node 22.19 or newer
+export PI_CODING_AGENT_DIR="$HOME/.pi/agent" # directory containing Pi's auth.json
+harness2 init --yes --executor pi
+harness2 doctor
+```
+
+The editable Pi harness surface is `AGENTS.md`, `.agents/skills/` and `.agents/scripts/`.
+The runtime loads the top-level instructions and skill index; the agent reads skill bodies
+on demand. Pi CLI extensions, MCP servers and personal hooks are not loaded by this SDK
+host. Use `--max-calls` to bound work: this prototype does not report Pi cost in dollars.
+See [configuration](docs/configuration.md#pi-durable-prototype) for recovery details.
 
 ## Driving it from an agent
 

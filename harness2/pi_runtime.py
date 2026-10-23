@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,41 @@ from .settings import ConfigError
 
 RUNTIME_VERSION = "1.4.0"
 HOST = Path(__file__).resolve().parents[1] / "pi-runtime" / "host.mjs"
+
+
+def pi_preflight(node_bin: str = "node") -> str:
+    """Check the installed opt-in runtime without sending a model request."""
+    if not HOST.is_file():
+        raise ConfigError(f"Pi host is missing at {HOST}; use the source checkout")
+    manifest = HOST.parent / "node_modules/@earendil-works/pi-durable/package.json"
+    if not manifest.is_file():
+        raise ConfigError(f"Pi Durable is not installed; run npm ci --prefix {HOST.parent}")
+    try:
+        version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+    except (OSError, ValueError, KeyError) as exc:
+        raise ConfigError(f"cannot read Pi Durable package metadata: {manifest}") from exc
+    if version != RUNTIME_VERSION:
+        raise ConfigError(f"Pi Durable {version} installed; expected {RUNTIME_VERSION}")
+    try:
+        result = subprocess.run(
+            [node_bin, "--version"], capture_output=True, text=True, timeout=10, check=True
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ConfigError(f"Node is unavailable: {exc}") from exc
+    match = re.match(r"v(\d+)\.(\d+)\.", result.stdout.strip())
+    if not match or tuple(map(int, match.groups())) < (22, 19):
+        raise ConfigError(f"Pi requires Node 22.19 or newer; found {result.stdout.strip()}")
+    auth_dir = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent")
+    auth = auth_dir.expanduser() / "auth.json"
+    if not auth.is_file():
+        raise ConfigError(f"Pi credentials not found at {auth}; set PI_CODING_AGENT_DIR")
+    try:
+        credentials = json.loads(auth.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"Pi credentials are unreadable at {auth}") from exc
+    if not isinstance(credentials, dict) or not credentials:
+        raise ConfigError(f"Pi has no credentials in {auth}; log in with Pi")
+    return f"Node {result.stdout.strip()}, Pi Durable {version}, credentials at {auth_dir}"
 
 
 class PiBusy(RuntimeError):
@@ -179,8 +215,11 @@ def run_pi_session(
         if previous := _result(session_dir, descriptor):
             return previous
         env = dict(os.environ)
-        if agent_dir is not None:
-            env["PI_CODING_AGENT_DIR"] = str(Path(agent_dir).resolve())
+        env["PI_CODING_AGENT_DIR"] = str(
+            Path(agent_dir or env.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent")
+            .expanduser()
+            .resolve()
+        )
         try:
             process = subprocess.run(
                 [node_bin, str(HOST), str(path)],

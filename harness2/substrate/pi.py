@@ -79,7 +79,11 @@ class PiSubstrate:
         return "\n".join(rows)[-max_chars:]
 
     def final_message(self, stream_path: Path) -> str:
-        data = json.loads(Path(stream_path).with_name("result.json").read_text(encoding="utf-8"))
+        path = Path(stream_path)
+        result = path.with_name("result.json")
+        if not result.is_file():
+            result = path.parent / "pi-session/result.json"
+        data = json.loads(result.read_text(encoding="utf-8"))
         return str(data.get("answer", ""))
 
     def cost_usd(self, stream_path: Path) -> float:

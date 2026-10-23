@@ -2,6 +2,8 @@
 
 import json
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,3 +70,18 @@ class PiRuntimeTests(unittest.TestCase):
         with pi_session_lock(path):
             with self.assertRaises(PiBusy):
                 self.call()
+
+    def test_child_retains_lock_after_parent_closes_its_descriptor(self):
+        path = self.root / "session"
+        with pi_session_lock(path) as fd:
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(0.5)"], pass_fds=(fd,)
+            )
+        try:
+            with self.assertRaises(PiBusy):
+                with pi_session_lock(path):
+                    pass
+        finally:
+            child.wait(timeout=5)
+        with pi_session_lock(path):
+            pass
