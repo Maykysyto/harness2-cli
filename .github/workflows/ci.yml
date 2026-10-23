@@ -38,3 +38,14 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uvx ruff check harness2 tests plugins
       - run: uvx ruff format --check harness2 tests plugins
+
+  pi-runtime:
+    name: Pi Durable host (Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefix pi-runtime
+      - run: npm test --prefix pi-runtime
