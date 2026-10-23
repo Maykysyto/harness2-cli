@@ -8,7 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness2.pi_runtime import PiBusy, PiDescriptorMismatch, pi_session_lock, run_pi_session
+from harness2.pi_runtime import (
+    PiBusy,
+    PiDescriptorMismatch,
+    PiUnsafe,
+    pi_session_lock,
+    run_pi_session,
+)
 
 FAKE_NODE = """#!/usr/bin/env python3
 import json, pathlib, sys
@@ -85,3 +91,19 @@ class PiRuntimeTests(unittest.TestCase):
             child.wait(timeout=5)
         with pi_session_lock(path):
             pass
+
+    def test_timeout_after_external_effect_blocks_automatic_resume(self):
+        unsafe = self.root / "unsafe-node"
+        unsafe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys, time\n"
+            "root = pathlib.Path(sys.argv[2]).parent\n"
+            "(root / 'unsafe-effect.json').write_text('{\"kind\":\"exec\"}')\n"
+            "time.sleep(3)\n"
+        )
+        unsafe.chmod(unsafe.stat().st_mode | stat.S_IXUSR)
+        with self.assertRaises(PiUnsafe):
+            self.call(node_bin=str(unsafe), timeout=0.2)
+        with self.assertRaises(PiUnsafe):
+            self.call(node_bin=str(self.node))
+        self.assertFalse((self.root / "session/calls.txt").exists())

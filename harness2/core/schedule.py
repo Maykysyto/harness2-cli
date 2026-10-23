@@ -408,6 +408,8 @@ def _resume(
             fingerprint = sel.get("harness_fingerprint")
             if fingerprint and runmark.fingerprint(harness_dir) != fingerprint:
                 raise ValueError("adopted harness has changed")
+        except events.Stopped:
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"  [{task_id}] cannot resume {mode}: {exc}; re-running", flush=True)
             return False

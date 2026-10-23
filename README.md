@@ -117,7 +117,8 @@ The opt-in Pi path runs the built-in tasks suite through Pi's SDK runtime. Pi ha
 rollouts, improver, selector, reflector and rubric judge calls; Code Mode is available in
 each session. Each call has its own Pi Durable SQLite database under the run's audit files.
 An interrupted Pi call resumes with the same request ID and workspace when the same command
-is run again. In the checkout containing this prototype:
+is run again. If a write or shell command may still have an effect, the host blocks automatic
+recovery until that effect is inspected. In the checkout containing this prototype:
 
 ```bash
 python -m pip install -e .

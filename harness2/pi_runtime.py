@@ -66,6 +66,10 @@ class PiRecoverable(RuntimeError):
     """The Pi call has not produced a final answer; reissue the same run to resume."""
 
 
+class PiUnsafe(RuntimeError):
+    """A prior host stopped after a possible external effect; inspect before resuming."""
+
+
 @dataclass(frozen=True)
 class PiResult:
     answer: str
@@ -167,6 +171,15 @@ def _result(session_dir: Path, descriptor: dict) -> PiResult | None:
     )
 
 
+def _assert_no_uncertain_effect(session_dir: Path) -> None:
+    marker = session_dir / "unsafe-effect.json"
+    if marker.exists():
+        raise PiUnsafe(
+            f"Pi may have an unfinished external effect in {marker}; inspect the workspace "
+            "and process tree before manually clearing this marker"
+        )
+
+
 def run_pi_session(
     *,
     slot: str,
@@ -212,6 +225,7 @@ def run_pi_session(
             if (session_dir / "session.sqlite").exists():
                 raise PiDescriptorMismatch("Pi database exists without its request descriptor")
             _atomic_json(path, descriptor)
+        _assert_no_uncertain_effect(session_dir)
         if previous := _result(session_dir, descriptor):
             return previous
         env = dict(os.environ)
@@ -221,7 +235,7 @@ def run_pi_session(
             .resolve()
         )
         try:
-            process = subprocess.run(
+            process = subprocess.Popen(
                 [node_bin, str(HOST), str(path)],
                 cwd=cwd,
                 env=env,
@@ -229,17 +243,32 @@ def run_pi_session(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 pass_fds=(owned_fd,),
             )
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        except OSError as exc:
             if completed := _result(session_dir, descriptor):
                 return completed
             raise PiRecoverable(f"Pi host interrupted for {descriptor['slot']}: {exc}") from exc
-        (session_dir / "host-stderr.log").write_text(process.stderr[-16000:], encoding="utf-8")
+        timed_out = False
+        try:
+            _stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            if process.poll() is None:
+                process.terminate()  # The host cleans up active tool groups on SIGTERM.
+            try:
+                _stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _stdout, stderr = process.communicate()
+        log = session_dir / "host-stderr.log"
+        log.write_text(stderr[-16000:], encoding="utf-8")
+        os.chmod(log, 0o600)
+        _assert_no_uncertain_effect(session_dir)
         if completed := _result(session_dir, descriptor):
             return completed
         raise PiRecoverable(
-            f"Pi host did not complete {descriptor['slot']} (exit {process.returncode}); "
+            f"Pi host did not complete {descriptor['slot']} "
+            f"({'timeout' if timed_out else f'exit {process.returncode}'}); "
             f"see {session_dir / 'host-stderr.log'}"
         )

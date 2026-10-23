@@ -46,7 +46,7 @@ test('Pi Durable executes Code Mode and records its nested result', async () => 
   try {
     const faux = fauxProvider();
     faux.setResponses([
-      fauxAssistantMessage([fauxToolCall('codemode', { code: 'text(\"SCRIPT_OK\")' })], { stopReason: 'toolUse' }),
+      fauxAssistantMessage([fauxToolCall('codemode', { code: 'await tools.write({path:"output/code-mode.txt",content:"SCRIPT_OK"}); const r = await tools.bash({command:"cat output/code-mode.txt"}); text(r.output)' })], { stopReason: 'toolUse' }),
       fauxAssistantMessage([fauxText('AFTER')]),
     ]);
     const models = createModels();
@@ -60,6 +60,7 @@ test('Pi Durable executes Code Mode and records its nested result', async () => 
     await writeFile(path, JSON.stringify(descriptor));
     const result = await runDescriptor(path, { models });
     assert.equal(result.answer, 'AFTER');
+    assert.equal(await readFile(join(dir, 'output/code-mode.txt'), 'utf8'), 'SCRIPT_OK');
     const trajectory = await readFile(join(dir, 'trajectory.jsonl'), 'utf8');
     assert.match(trajectory, /SCRIPT_OK/);
     assert.match(trajectory, /codemode/);
@@ -139,6 +140,46 @@ test('a process killed after settlement resumes without a second model response'
     const result = JSON.parse(await readFile(join(dir, 'child-result.json'), 'utf8'));
     assert.deepEqual(result, { answer: 'ONE', pending: 1 });
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a process killed after a tool effect refuses automatic resume', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'h2-pi-effect-'));
+  const childDir = await mkdtemp(join(import.meta.dirname, 'effect-child-'));
+  try {
+    const path = join(dir, 'request.json');
+    await writeFile(path, JSON.stringify({
+      version: 1, slot: 'role/improver', fingerprint: 'effect-request',
+      requestId: 'h2-effect-one', sessionDir: dir, cwd: dir,
+      model: 'faux/faux-1', effort: 'low', system: '', prompt: 'Write a file.',
+    }));
+    const hostUrl = pathToFileURL(join(import.meta.dirname, '../host.mjs')).href;
+    const source = `
+      import { createModels } from '@earendil-works/pi-ai/models';
+      import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
+      const { runDescriptor } = await import(${JSON.stringify(hostUrl)});
+      const faux = fauxProvider();
+      faux.setResponses([
+        fauxAssistantMessage([fauxToolCall('codemode', { code: 'text(await tools.write({path:"effect.txt",content:"done"}))' })], { stopReason: 'toolUse' }),
+        fauxAssistantMessage('AFTER'),
+      ]);
+      const models = createModels(); models.setProvider(faux.provider);
+      await runDescriptor(${JSON.stringify(path)}, {
+        models, afterEffect: () => process.kill(process.pid, 'SIGKILL'),
+      });
+    `;
+    const childFile = join(childDir, 'child.mjs');
+    await writeFile(childFile, source);
+    const killed = spawnSync(process.execPath, [childFile], {
+      cwd: join(import.meta.dirname, '..'), timeout: 10000,
+    });
+    assert.equal(killed.signal, 'SIGKILL', `status=${killed.status} ${killed.stderr?.toString()}`);
+    assert.match(await readFile(join(dir, 'unsafe-effect.json'), 'utf8'), /writeFile/);
+    assert.equal(await readFile(join(dir, 'effect.txt'), 'utf8'), 'done');
+    await assert.rejects(runDescriptor(path), /unfinished external effect/);
+  } finally {
+    await rm(childDir, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
   }
 });

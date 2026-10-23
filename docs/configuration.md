@@ -66,7 +66,9 @@ session database in their audit directory. Rerun the same `harness2 run` command
 an incomplete call. Changing its model, effort, prompt, task inputs or harness while it is
 incomplete is rejected; inspect or finish the old call before starting different inputs.
 An interrupted external tool effect can be uncertain even when the submission is resumed:
-review the workspace and Pi trajectory before repeating an external action manually.
+the host leaves `pi-session/unsafe-effect.json` and refuses automatic recovery if it stopped
+after a write or command began. Review the workspace and process tree before manually
+clearing that marker and resuming the same submission. A normal completed call clears it.
 Pi's current cost field is zero, so use `--max-calls` rather than `--budget-usd` to cap it.
 
 ### Subscriptions

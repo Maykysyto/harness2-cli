@@ -36,8 +36,10 @@ from pathlib import Path
 
 from .. import providers
 from ..pi_runtime import (
+    PiBusy,
     PiDescriptorMismatch,
     PiRecoverable,
+    PiUnsafe,
     pi_session_lock,
     run_pi_session,
 )
@@ -148,7 +150,10 @@ class Proposer:
         if self.spec.kind == "human":
             raise ProposerError("the human channel needs an interactive selector")
         if self.spec.kind == "pi":
-            return self._call_pi(mission, context_dir, label, system, timeout, harvest)
+            try:
+                return self._call_pi(mission, context_dir, label, system, timeout, harvest)
+            except (PiBusy, PiDescriptorMismatch, PiUnsafe) as exc:
+                raise events.Stopped(f"Pi call cannot be reused: {exc}") from exc
         cache_key = _call_fingerprint(label, mission, system, context_dir, self.audit_dir)
         cached = self._cached(label, cache_key, require_workspace=bool(harvest))
         if cached is not None:
@@ -243,11 +248,6 @@ class Proposer:
         key = hashlib.sha256(
             f"{digest}\0{self.spec.model}\0{self.spec.effort}\0pi-1.4.0".encode()
         ).hexdigest()[:20]
-        cached = self._cached(label, key, require_workspace=bool(harvest))
-        if cached is not None:
-            self._calls.append(cached)
-            self._emit(cached)
-            return cached
         root = Path(self.audit_dir)
         root.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
@@ -255,18 +255,51 @@ class Proposer:
         for old in root.glob(f"{safe}.*.working"):
             if old == working:
                 continue
-            if (old / "pi-session/request.json").is_file() and not (
-                old / "pi-session/result.json"
-            ).is_file():
+            if (old / "pi-session/unsafe-effect.json").is_file() or (
+                (old / "pi-session/request.json").is_file()
+                and not (old / "pi-session/result.json").is_file()
+            ):
                 raise PiDescriptorMismatch(
                     f"unfinished Pi call for {label} has different inputs in {old}"
                 )
+        cached = self._cached(label, key, require_workspace=bool(harvest))
+        if cached is not None:
+            if (working / "pi-session/unsafe-effect.json").is_file():
+                raise PiUnsafe(f"Pi call has an uncertain external effect: {working}")
+            self._calls.append(cached)
+            self._emit(cached)
+            return cached
         t0 = time.monotonic()
         with pi_session_lock(working / "pi-session") as lock_fd:
-            if not working.joinpath("context").exists() and context_dir:
-                source = Path(context_dir)
-                if source.is_dir():
-                    shutil.copytree(source, working / "context")
+            ready = working / "context-ready.json"
+            request_exists = (working / "pi-session/request.json").is_file()
+            if ready.is_file():
+                try:
+                    prepared = json.loads(ready.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise PiDescriptorMismatch(f"Pi context marker is unreadable: {ready}") from exc
+                if prepared.get("digest") != digest or (
+                    prepared.get("has_context") and not (working / "context").is_dir()
+                ):
+                    raise PiDescriptorMismatch(f"Pi context changed or is missing: {working}")
+            else:
+                if request_exists:
+                    raise PiDescriptorMismatch(
+                        f"Pi request exists without context marker: {working}"
+                    )
+                shutil.rmtree(working / "context", ignore_errors=True)
+                source = Path(context_dir) if context_dir else None
+                has_context = bool(source and source.is_dir())
+                if has_context:
+                    staged = Path(tempfile.mkdtemp(prefix="context-staging-", dir=working))
+                    try:
+                        shutil.copytree(source, staged, dirs_exist_ok=True)
+                        os.replace(staged, working / "context")
+                    finally:
+                        shutil.rmtree(staged, ignore_errors=True)
+                temp = ready.with_name(f"{ready.name}.{os.getpid()}.tmp")
+                temp.write_text(json.dumps({"digest": digest, "has_context": has_context}))
+                os.replace(temp, ready)
             with _SEM:
                 events.check()
                 try:

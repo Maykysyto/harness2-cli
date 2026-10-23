@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -75,15 +76,31 @@ def persistent_project_workspace(project: Path, ref: str, ws: Path) -> Path:
     return ws
 
 
+def discard_unprepared_project_workspace(project: Path, ws: Path) -> None:
+    """Remove a worktree whose Pi preparation never reached its durable marker."""
+    ws = Path(ws).resolve()
+    with _WORKTREES:
+        subprocess.run(
+            ["git", "-C", str(project), "worktree", "remove", "--force", str(ws)],
+            capture_output=True,
+        )
+    shutil.rmtree(ws, ignore_errors=True)
+
+
 def persistent_files_workspace(src: Path | None, ws: Path) -> Path:
     """Copy task inputs only on the first attempt of a durable rollout."""
     ws = Path(ws).resolve()
     if ws.exists():
         return ws
-    ws.mkdir(parents=True)
-    if src is not None:
-        shutil.copytree(src, ws, dirs_exist_ok=True)
-    (ws / "output").mkdir(exist_ok=True)
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(tempfile.mkdtemp(prefix=f"{ws.name}.staging-", dir=ws.parent))
+    try:
+        if src is not None:
+            shutil.copytree(src, staged, dirs_exist_ok=True)
+        (staged / "output").mkdir(exist_ok=True)
+        os.replace(staged, ws)
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
     return ws
 
 

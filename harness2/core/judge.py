@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from . import runmark
+from . import events, runmark
 from .spec import BenchmarkAdapter
 
 
@@ -75,6 +75,8 @@ def judge_one(
     )
     try:
         got = adapter.score(run_dir, task_id)
+    except events.Stopped:
+        raise
     except Exception as exc:
         s.error = f"{type(exc).__name__}: {exc}"
         return s
@@ -128,6 +130,8 @@ def judge_selections(
         for f in as_completed(futs):
             try:
                 out.append(f.result())
+            except events.Stopped:
+                raise
             except Exception as exc:
                 sel = futs[f]
                 out.append(

@@ -1,4 +1,4 @@
-import { readdir, rename, readFile, writeFile } from 'node:fs/promises';
+import { readdir, rename, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
@@ -6,10 +6,56 @@ import { CodemodeSandbox } from '@earendil-works/pi-codemode';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { AssistantEntry, createRegistry, Harness } from '@earendil-works/pi-durable';
 import { createCodemodeExtension } from '@earendil-works/pi-durable/codemode';
+import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { CodingTools } from '@earendil-works/pi-durable/tools';
 
 const CONTEXT = BACKGROUND_CONTEXT;
+const ACTIVE_ENVIRONMENTS = new Set();
+
+class EffectGuard {
+  constructor(sessionDir) {
+    this.path = join(sessionDir, 'unsafe-effect.json');
+    this.marking = undefined;
+  }
+
+  async assertSafe() {
+    try {
+      await readFile(this.path);
+      throw new Error(`Pi may have an unfinished external effect in ${this.path}; inspect the workspace and process tree before manually clearing this marker`);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+
+  async mark(kind) {
+    this.marking ??= atomicJson(this.path, { kind, startedAt: new Date().toISOString() });
+    await this.marking;
+  }
+
+  async settled() {
+    if (this.marking) await this.marking;
+    await rm(this.path, { force: true });
+  }
+}
+
+class GuardedNodeExecutionEnv extends NodeExecutionEnv {
+  constructor(options, guard, afterEffect) {
+    super(options);
+    this.guard = guard;
+    this.afterEffect = afterEffect;
+  }
+
+  async exec(...args) {
+    await this.guard.mark('exec');
+    return super.exec(...args);
+  }
+
+  async writeFile(...args) {
+    await this.guard.mark('writeFile');
+    const result = await super.writeFile(...args);
+    if (result.ok && this.afterEffect) await this.afterEffect();
+    return result;
+  }
+}
 
 function assertDescriptor(value, path) {
   if (!value || value.version !== 1) throw new Error('unsupported Pi descriptor version');
@@ -95,8 +141,10 @@ async function modelsFromPi() {
   });
 }
 
-export async function runDescriptor(path, { models, afterSettled } = {}) {
+export async function runDescriptor(path, { models, afterSettled, afterEffect } = {}) {
   const descriptor = assertDescriptor(JSON.parse(await readFile(path, 'utf8')), path);
+  const guard = new EffectGuard(descriptor.sessionDir);
+  await guard.assertSafe();
   const resultPath = join(descriptor.sessionDir, 'result.json');
   let prior;
   try { prior = JSON.parse(await readFile(resultPath, 'utf8')); }
@@ -115,9 +163,21 @@ export async function runDescriptor(path, { models, afterSettled } = {}) {
   const sandbox = new CodemodeSandbox({ memoryLimitBytes: 256 * 1024 * 1024 });
   registry.install(CodingTools);
   registry.install(createCodemodeExtension({ sandbox }));
+  const environments = new Map();
   const harness = await Harness.open(
     await openNodeSqliteStorage(join(descriptor.sessionDir, 'session.sqlite')),
-    { models: models ?? await modelsFromPi(), registry }, CONTEXT,
+    {
+      models: models ?? await modelsFromPi(), registry,
+      env: ({ cwd }) => {
+        const directory = cwd ?? descriptor.cwd;
+        if (!environments.has(directory)) {
+          const environment = new GuardedNodeExecutionEnv({ cwd: directory }, guard, afterEffect);
+          environments.set(directory, environment);
+          ACTIVE_ENVIRONMENTS.add(environment);
+        }
+        return environments.get(directory);
+      },
+    }, CONTEXT,
   );
   try {
     const root = await harness.root(CONTEXT, {
@@ -138,6 +198,7 @@ export async function runDescriptor(path, { models, afterSettled } = {}) {
     }
     const answer = assistantText(await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), CONTEXT));
     if (!answer.trim()) throw new Error(`Pi submission ${submission.id} returned an empty answer`);
+    await guard.settled();
     if (afterSettled) await afterSettled();
     const result = {
       version: 1, slot: descriptor.slot, fingerprint: descriptor.fingerprint,
@@ -148,12 +209,20 @@ export async function runDescriptor(path, { models, afterSettled } = {}) {
     await atomicJson(resultPath, result);
     return result;
   } finally {
+    for (const environment of environments.values()) {
+      await environment.cleanup(CONTEXT);
+      ACTIVE_ENVIRONMENTS.delete(environment);
+    }
     await harness.close(CONTEXT);
     await sandbox.close();
   }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.once('SIGTERM', async () => {
+    for (const environment of ACTIVE_ENVIRONMENTS) await environment.cleanup(CONTEXT);
+    process.exit(124);
+  });
   try {
     const result = await runDescriptor(process.argv[2]);
     process.stdout.write(`${JSON.stringify(result)}\n`);
