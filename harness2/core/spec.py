@@ -30,7 +30,7 @@ from .tree import SurfaceSpec
 
 ModelId = str
 
-CHANNELS = ("claude", "codex", "opencode", "human")
+CHANNELS = ("claude", "codex", "opencode", "pi", "human")
 
 
 @dataclass(frozen=True)

@@ -62,6 +62,31 @@ def _add_worktree(project: Path, ws: Path, ref: str) -> None:
         raise ConfigError(f"cannot create project workspace at {ref!r}: {result.stderr.strip()}")
 
 
+def persistent_project_workspace(project: Path, ref: str, ws: Path) -> Path:
+    """Create a rollout worktree once; the caller keeps it until the run is closed."""
+    ws = Path(ws).resolve()
+    if ws.exists():
+        if not (ws / ".git").exists():
+            raise ConfigError(f"incomplete project workspace at {ws}; inspect before recovery")
+        return ws
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    with _WORKTREES:
+        _add_worktree(project, ws, ref)
+    return ws
+
+
+def persistent_files_workspace(src: Path | None, ws: Path) -> Path:
+    """Copy task inputs only on the first attempt of a durable rollout."""
+    ws = Path(ws).resolve()
+    if ws.exists():
+        return ws
+    ws.mkdir(parents=True)
+    if src is not None:
+        shutil.copytree(src, ws, dirs_exist_ok=True)
+    (ws / "output").mkdir(exist_ok=True)
+    return ws
+
+
 @contextmanager
 def files_workspace(src: Path | None) -> Iterator[Path]:
     ws = Path(tempfile.mkdtemp(prefix="harness2-ws-")).resolve()

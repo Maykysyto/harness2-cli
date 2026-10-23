@@ -35,6 +35,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import providers
+from ..pi_runtime import (
+    PiDescriptorMismatch,
+    PiRecoverable,
+    pi_session_lock,
+    run_pi_session,
+)
+from ..settings import ConfigError
 from ..substrate.codex import CodexSubstrate, parse_items_text
 from . import events
 from .spec import ChannelSpec
@@ -140,6 +147,8 @@ class Proposer:
 
         if self.spec.kind == "human":
             raise ProposerError("the human channel needs an interactive selector")
+        if self.spec.kind == "pi":
+            return self._call_pi(mission, context_dir, label, system, timeout, harvest)
         cache_key = _call_fingerprint(label, mission, system, context_dir, self.audit_dir)
         cached = self._cached(label, cache_key, require_workspace=bool(harvest))
         if cached is not None:
@@ -218,6 +227,82 @@ class Proposer:
             attempts=tries,
             cost_usd=spent_usd,
         )
+
+    def _call_pi(
+        self,
+        mission: str,
+        context_dir: Path | str | None,
+        label: str,
+        system: str,
+        timeout: int | None,
+        harvest: str | None,
+    ) -> Reply:
+        if self.audit_dir is None:
+            raise ConfigError("Pi calls need a stable audit_dir for Durable recovery")
+        digest = _call_fingerprint(label, mission, system, context_dir, self.audit_dir)
+        key = hashlib.sha256(
+            f"{digest}\0{self.spec.model}\0{self.spec.effort}\0pi-1.4.0".encode()
+        ).hexdigest()[:20]
+        cached = self._cached(label, key, require_workspace=bool(harvest))
+        if cached is not None:
+            self._calls.append(cached)
+            self._emit(cached)
+            return cached
+        root = Path(self.audit_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
+        working = root / f"{safe}.{key}.working"
+        for old in root.glob(f"{safe}.*.working"):
+            if old == working:
+                continue
+            if (old / "pi-session/request.json").is_file() and not (
+                old / "pi-session/result.json"
+            ).is_file():
+                raise PiDescriptorMismatch(
+                    f"unfinished Pi call for {label} has different inputs in {old}"
+                )
+        t0 = time.monotonic()
+        with pi_session_lock(working / "pi-session") as lock_fd:
+            if not working.joinpath("context").exists() and context_dir:
+                source = Path(context_dir)
+                if source.is_dir():
+                    shutil.copytree(source, working / "context")
+            with _SEM:
+                events.check()
+                try:
+                    result = run_pi_session(
+                        slot=f"role/{label}",
+                        session_dir=working / "pi-session",
+                        cwd=working,
+                        model=self.spec.model,
+                        effort=self.spec.effort,
+                        system=system,
+                        prompt=mission,
+                        context_digest=digest,
+                        node_bin=self.spec.bin or "node",
+                        timeout=int(timeout or self.spec.timeout),
+                        lock_fd=lock_fd,
+                    )
+                except PiRecoverable as exc:
+                    raise events.Stopped(f"recoverable Pi call: {exc}") from exc
+            reply = Reply(
+                label=label,
+                text=result.answer,
+                ok=True,
+                cost_usd=0.0,
+                wall_s=round(time.monotonic() - t0, 1),
+                attempts=1,
+                channel="pi",
+                workspace=working / harvest if harvest else None,
+            )
+            if harvest:
+                reply.workspace = self._harvest(working, harvest, label, key)
+                if reply.workspace is None:
+                    _drop_workspace(self._paths(label, key))
+            self._write_audit(reply, mission, system, key)
+            self._calls.append(reply)
+            self._emit(reply)
+            return reply
 
     def _claude(self, cwd: Path, mission: str, system: str, wall: int) -> tuple[str, float, str]:
         login = self.spec.provider is not None and self.spec.provider.type == "claude-login"

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import json
@@ -36,12 +37,14 @@ from .core import events, runmark, tree
 from .core.library import slug
 from .core.proposer import Proposer, ProposerError, _parse_json
 from .core.spec import BenchPrompts, BenchSpec, ChannelSpec
+from .pi_runtime import PiBusy, PiDescriptorMismatch, PiRecoverable, pi_session_lock, run_pi_session
 from .registry import SuiteContext
 from .settings import ConfigError, Settings
 from .substrate._native import checked_path, cli_argv
 from .substrate.claude import ClaudeSubstrate, parse_events
 from .substrate.codex import CodexSubstrate
 from .substrate.command import CommandSubstrate
+from .substrate.pi import PiSubstrate
 
 DESCRIPTION = "Tasks"
 
@@ -280,7 +283,7 @@ def _channel(settings: Settings, role: str) -> ChannelSpec:
     if kind == "human" and role != "selector":
         raise ConfigError("the human channel is only allowed for selector")
     provider = None
-    if kind != "human":
+    if kind not in ("human", "pi"):
         provider_name, _ = providers.split_model(values["model"])
         provider = settings.provider(provider_name)
     try:
@@ -320,8 +323,11 @@ class GenericAdapter:
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
             install_mode = "command_files"
+        elif name == "pi":
+            self.substrate = PiSubstrate()
+            install_mode = "pi_root"
         else:
-            raise ConfigError("the tasks suite runs on claude, codex or command")
+            raise ConfigError("the tasks suite runs on claude, codex, pi or command")
         self.spec = BenchSpec(
             name="tasks",
             runs_root=ctx.run_root,
@@ -414,6 +420,8 @@ class GenericAdapter:
         run_dir = self.spec.runs_root / "rollouts" / run_name
         if runmark.is_complete(run_dir, harness_dir=harness_dir):
             return run_dir
+        if self.executor["name"] == "pi":
+            return self._execute_pi(task_id, config, harness_dir, run_id, run_dir, timeout)
         if run_dir.exists():
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True)
@@ -523,6 +531,121 @@ class GenericAdapter:
         runmark.mark_complete(run_dir, run_id=run_id, harness_dir=harness_dir)
         return run_dir
 
+    def _execute_pi(
+        self,
+        task_id: str,
+        config: dict,
+        harness_dir: Path,
+        run_id: str,
+        run_dir: Path,
+        timeout: int | None,
+    ) -> Path:
+        """Resume the same Pi submission in the same prepared workspace."""
+        session_dir = run_dir / "pi-session"
+        started = time.monotonic()
+        with pi_session_lock(session_dir) as lock_fd:
+            if runmark.is_complete(run_dir, harness_dir=harness_dir):
+                return run_dir
+            ws = run_dir / "workspace"
+            prompt = self.task_prompt(task_id)
+            if config["workspace"] == "files":
+                prompt += FILES_PROMPT_SUFFIX
+            harness_digest = runmark.fingerprint(harness_dir)
+            identity = {
+                "task_id": task_id,
+                "config": config,
+                "prompt": prompt,
+                "harness": harness_digest,
+                "model": self.executor["model"],
+                "effort": self.executor["effort"],
+            }
+            if config["workspace"] == "files":
+                identity["inputs"] = runmark.fingerprint(self.task_files(task_id))
+            else:
+                identity["ref_commit"] = subprocess.check_output(
+                    ["git", "-C", str(self.ctx.project), "rev-parse", config["ref"]],
+                    text=True,
+                ).strip()
+            prepared_path = run_dir / "pi-prepared.json"
+            if prepared_path.is_file():
+                prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+                if prepared.get("identity") != identity or not ws.is_dir():
+                    raise PiDescriptorMismatch(
+                        f"Pi rollout inputs changed or workspace is missing: {run_dir}"
+                    )
+            else:
+                if (session_dir / "request.json").exists():
+                    raise PiDescriptorMismatch(
+                        f"Pi request exists without prepared workspace: {run_dir}"
+                    )
+                if config["workspace"] == "project":
+                    workspace.persistent_project_workspace(self.ctx.project, config["ref"], ws)
+                else:
+                    workspace.persistent_files_workspace(self.task_files(task_id), ws)
+                self.substrate.strip_native(ws)
+                if config["workspace"] == "project":
+                    state = ws / ".harness2"
+                    if state.is_symlink() or state.is_file():
+                        state.unlink()
+                    else:
+                        shutil.rmtree(state, ignore_errors=True)
+                install = self.substrate.materialise(harness_dir, self.spec, {})
+                try:
+                    self.substrate.install_into(install, ws)
+                finally:
+                    shutil.rmtree(install.staging_dir, ignore_errors=True)
+                base = ""
+                if config["workspace"] == "project":
+                    workspace.commit_all(ws, "harness2: candidate Pi harness")
+                    base = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], cwd=ws, text=True
+                    ).strip()
+                prepared = {"identity": identity, "base": base}
+                prepared_path.write_text(json.dumps(prepared, indent=2), encoding="utf-8")
+            (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+            try:
+                result = run_pi_session(
+                    slot=f"rollout/{run_id}",
+                    session_dir=session_dir,
+                    cwd=ws,
+                    model=self.executor["model"],
+                    effort=self.executor["effort"],
+                    system="",
+                    prompt=prompt,
+                    context_digest=prepared["base"] or task_id,
+                    harness_digest=harness_digest,
+                    node_bin=self.executor["bin"] or "node",
+                    timeout=config.get("timeout") or timeout or self.executor["timeout"],
+                    lock_fd=lock_fd,
+                )
+            except (PiRecoverable, PiBusy) as exc:
+                raise events.Stopped(f"recoverable Pi rollout: {exc}") from exc
+            stream = run_dir / "stream.jsonl"
+            shutil.copyfile(result.trajectory, stream)
+            if config["workspace"] == "project":
+                (run_dir / "deliverable.patch").write_text(
+                    workspace.diff_since(
+                        ws, prepared["base"], (*self.substrate.NATIVE_PATHS, ".harness2")
+                    ),
+                    encoding="utf-8",
+                )
+            if (ws / "output").is_dir():
+                shutil.copytree(ws / "output", run_dir / "output", dirs_exist_ok=True)
+            (run_dir / "final.md").write_text(result.answer, encoding="utf-8")
+            meta = {
+                "task_id": task_id,
+                "deliverable": config["deliverable"],
+                "ok": True,
+                "exit_code": 0,
+                "wall_s": round(time.monotonic() - started, 3),
+                "cost_usd": 0.0,
+                "timed_out": False,
+                "pi_submission_id": result.submission_id,
+            }
+            (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            runmark.mark_complete(run_dir, run_id=run_id, harness_dir=harness_dir)
+            return run_dir
+
     def _meta(self, run_dir: Path) -> dict:
         """The rollout's meta.json, or {} for a rollout that died before writing one."""
         try:
@@ -602,6 +725,7 @@ class GenericAdapter:
             identity = {
                 "channel": judge_channel.kind,
                 "model": judge_channel.model,
+                "effort": judge_channel.effort,
                 "rubric_sha256": hashlib.sha256((task_dir / "rubric.md").read_bytes()).hexdigest(),
             }
         else:
@@ -651,21 +775,40 @@ class GenericAdapter:
                 result = counts or {"n_passed": int(code == 0), "n_criteria": 1}
                 result.update(exit_code=code, output_tail=(output + stderr)[-2000:])
         elif (task_dir / "rubric.md").is_file():
-            with tempfile.TemporaryDirectory(prefix="harness2-judge-") as tmp:
+            if judge_channel.kind == "pi":
+                suffix = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[
+                    :16
+                ]
+                stable = run_dir / f"pi-judge-context-{suffix}"
+                fresh = not stable.exists()
+                stable.mkdir(exist_ok=True)
+                context_scope = contextlib.nullcontext(stable)
+            else:
+                fresh = True
+                context_scope = tempfile.TemporaryDirectory(prefix="harness2-judge-")
+            with context_scope as tmp:
                 context = Path(tmp)
-                shutil.copyfile(task_dir / "task.md", context / "task.md")
-                shutil.copyfile(task_dir / "rubric.md", context / "rubric.md")
-                dest = context / "deliverables"
-                dest.mkdir()
-                if config["deliverable"] == "files" and (run_dir / "output").is_dir():
-                    shutil.copytree(run_dir / "output", dest, dirs_exist_ok=True)
-                else:
-                    name = "deliverable.patch" if config["deliverable"] == "diff" else "final.md"
-                    if (run_dir / name).is_file():
-                        shutil.copyfile(run_dir / name, dest / name)
-                shutil.copyfile(run_dir / "final.md", dest / "final.md")
+                if fresh:
+                    shutil.copyfile(task_dir / "task.md", context / "task.md")
+                    shutil.copyfile(task_dir / "rubric.md", context / "rubric.md")
+                    dest = context / "deliverables"
+                    dest.mkdir()
+                    if config["deliverable"] == "files" and (run_dir / "output").is_dir():
+                        shutil.copytree(run_dir / "output", dest, dirs_exist_ok=True)
+                    else:
+                        name = (
+                            "deliverable.patch" if config["deliverable"] == "diff" else "final.md"
+                        )
+                        if (run_dir / name).is_file():
+                            shutil.copyfile(run_dir / name, dest / name)
+                    shutil.copyfile(run_dir / "final.md", dest / "final.md")
                 try:
-                    reply = Proposer(judge_channel).call(
+                    reply = Proposer(
+                        judge_channel,
+                        audit_dir=run_dir / "pi-judge-audit"
+                        if judge_channel.kind == "pi"
+                        else None,
+                    ).call(
                         mission=RUBRIC_MISSION,
                         context_dir=context,
                         label=f"judge.{task_id}.{slug(run_dir.name)}",
