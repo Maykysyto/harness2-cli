@@ -147,6 +147,8 @@ class Proposer:
         directory is destroyed -- e.g. "context/harness", which is how an edited tree comes back.
         """
 
+        if self.spec.managed is not None:
+            return self._call_managed(mission, context_dir, label, system, timeout, harvest)
         if self.spec.kind == "human":
             raise ProposerError("the human channel needs an interactive selector")
         if self.spec.kind == "pi":
@@ -232,6 +234,81 @@ class Proposer:
             attempts=tries,
             cost_usd=spent_usd,
         )
+
+    def _call_managed(self, mission, context_dir, label, system, timeout, harvest):
+        from .. import managed
+
+        if self.audit_dir is None:
+            raise ConfigError("managed calls require a stable audit_dir")
+        root = Path(self.audit_dir)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
+        slot = root / f"{safe}.managed"
+        context = Path(context_dir).resolve() if context_dir else None
+        fingerprint = managed.digest(
+            {
+                "label": label,
+                "mission": mission,
+                "system": system,
+                "context": str(context) if context else None,
+                "context_digest": managed.tree_digest(context),
+            }
+        )
+
+        def prepare(ws):
+            ws.mkdir()
+            (ws / "output").mkdir()
+            if context_dir and Path(context_dir).is_dir():
+                shutil.copytree(context_dir, ws / "context")
+
+        replies = []
+
+        def finalize(result):
+            reply = Reply(
+                label=label,
+                text=result.text,
+                ok=True,
+                attempts=1,
+                channel="codex",
+                workspace=managed.harvest_snapshot(slot, result.workspace, harvest),
+            )
+            if not managed.completed(slot):
+                self._write_audit(reply, mission, system)
+                paths = self._paths(label)
+                managed.completed(
+                    slot,
+                    [path for key, path in paths.items() if key != "workspace" and path.is_file()]
+                    + ([slot / "harvest.json"] if (slot / "harvest.json").is_file() else []),
+                    trees=[slot / "harvest"],
+                )
+            else:
+                reply.audit = self._paths(label)["response"]
+            managed.atomic(
+                slot / "complete.json", {"request_digest": result.response["request_digest"]}
+            )
+            replies.append(reply)
+
+        try:
+            managed.execute(
+                config=self.spec.managed,
+                slot=slot,
+                role=self.spec.role,
+                model=self._model(),
+                effort=self.spec.effort,
+                prompt=(f"# SYSTEM INSTRUCTIONS\n{system}\n\n" if system else "") + mission,
+                harness_digest=managed.tree_digest(context / "harness" if context else None),
+                provider=self.spec.provider,
+                timeout=int(timeout or self.spec.timeout),
+                prepare=prepare,
+                binary=self.spec.bin,
+                inputs=fingerprint,
+                finalize=finalize,
+            )
+        except managed.ManagedError as exc:
+            raise events.Stopped(f"managed call stopped: {exc}") from exc
+        reply = replies[0]
+        self._calls.append(reply)
+        self._emit(reply)
+        return reply
 
     def _call_pi(
         self,

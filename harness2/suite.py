@@ -32,7 +32,7 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 
-from . import providers, workspace
+from . import managed, providers, workspace
 from .core import events, runmark, tree
 from .core.library import slug
 from .core.proposer import Proposer, ProposerError, _parse_json
@@ -285,6 +285,9 @@ def import_tasks(tasks_dir: Path, source: Path, *, force: bool) -> list[str]:
 
 
 def _channel(settings: Settings, role: str) -> ChannelSpec:
+    managed_config = managed.ManagedConfig.from_settings(settings)
+    if managed_config is not None and role == "judge":
+        raise ConfigError("managed judge is unsupported in v1")
     values = settings.role(role)
     kind = values["channel"]
     if kind == "human" and role != "selector":
@@ -302,6 +305,8 @@ def _channel(settings: Settings, role: str) -> ChannelSpec:
             timeout=values["timeout"],
             steps=values["steps"],
             provider=provider,
+            managed=managed_config,
+            role=role,
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
@@ -314,6 +319,7 @@ class GenericAdapter:
         self.ctx = ctx
         self.settings = ctx.settings
         self.tasks_dir = self.settings.path("paths.tasks")
+        self.managed = managed.ManagedConfig.from_settings(self.settings)
         self.executor = self.settings.section("executor")
         name = self.executor["name"]
         if name == "claude":
@@ -425,6 +431,11 @@ class GenericAdapter:
         if not run_name or run_name in (".", "..") or "\\" in run_name:
             raise ConfigError(f"invalid rollout id {run_id!r}")
         run_dir = self.spec.runs_root / "rollouts" / run_name
+        if self.managed is not None:
+            try:
+                return self._execute_managed(task_id, config, harness_dir, run_id, run_dir, timeout)
+            except managed.ManagedError as exc:
+                raise events.Stopped(f"managed rollout stopped: {exc}") from exc
         if self.executor["name"] == "pi":
             try:
                 return self._execute_pi(task_id, config, harness_dir, run_id, run_dir, timeout)
@@ -541,6 +552,112 @@ class GenericAdapter:
         runmark.mark_complete(run_dir, run_id=run_id, harness_dir=harness_dir)
         return run_dir
 
+    def _execute_managed(self, task_id, config, harness_dir, run_id, run_dir, timeout):
+        prompt = self.task_prompt(task_id)
+        if config["workspace"] == "files":
+            prompt += FILES_PROMPT_SUFFIX
+        provider_name, model = providers.split_model(self.executor["model"])
+        provider = self.settings.provider(provider_name)
+        base_path = run_dir / "base.json"
+        if (self.tasks_dir / task_id / "rubric.md").is_file():
+            raise ConfigError("managed judge is unsupported in v1")
+
+        def prepare(ws):
+            if config["workspace"] == "project":
+                workspace.persistent_project_workspace(self.ctx.project, config["ref"], ws)
+            else:
+                workspace.persistent_files_workspace(self.task_files(task_id), ws)
+            self.substrate.strip_native(ws)
+            state = ws / ".harness2"
+            if state.is_symlink() or state.is_file():
+                state.unlink()
+            elif state.is_dir():
+                shutil.rmtree(state)
+            install = self.substrate.materialise(harness_dir, self.spec, {})
+            try:
+                self.substrate.install_into(install, ws)
+            finally:
+                shutil.rmtree(install.staging_dir, ignore_errors=True)
+            base = ""
+            if config["workspace"] == "project":
+                workspace.commit_all(ws, "harness2: managed candidate harness")
+                base = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=ws, text=True
+                ).strip()
+            managed.atomic(base_path, {"base": base})
+
+        source_digest = (
+            managed.tree_digest(self.task_files(task_id)) if self.task_files(task_id) else None
+        )
+        revision = ""
+        if config["workspace"] == "project":
+            revision = subprocess.check_output(
+                ["git", "rev-parse", config["ref"]], cwd=self.ctx.project, text=True
+            ).strip()
+        started = time.monotonic()
+
+        def finalize(result):
+            if managed.completed(run_dir):
+                if not runmark.is_complete(run_dir, harness_dir=harness_dir):
+                    runmark.mark_complete(run_dir, run_id=run_id, harness_dir=harness_dir)
+                return
+            shutil.copyfile(result.stdout, run_dir / "stream.jsonl")
+            shutil.copyfile(result.stderr, run_dir / "stderr.log")
+            if config["workspace"] == "project":
+                base = json.loads(base_path.read_text())["base"]
+                (run_dir / "deliverable.patch").write_text(
+                    workspace.diff_since(
+                        result.workspace, base, (*self.substrate.NATIVE_PATHS, ".harness2")
+                    )
+                )
+            if (result.workspace / "output").is_dir():
+                shutil.copytree(result.workspace / "output", run_dir / "output", dirs_exist_ok=True)
+            (run_dir / "final.md").write_text(result.text, encoding="utf-8")
+            managed.atomic(
+                run_dir / "meta.json",
+                {
+                    "task_id": task_id,
+                    "deliverable": config["deliverable"],
+                    "ok": True,
+                    "exit_code": 0,
+                    "wall_s": round(time.monotonic() - started, 3),
+                    "cost_usd": 0.0,
+                    "timed_out": False,
+                    "managed_request_digest": result.response["request_digest"],
+                },
+            )
+            files = [
+                run_dir / name for name in ("stream.jsonl", "stderr.log", "final.md", "meta.json")
+            ]
+            if (run_dir / "deliverable.patch").is_file():
+                files.append(run_dir / "deliverable.patch")
+            files.extend(path for path in (run_dir / "output").rglob("*") if path.is_file())
+            managed.completed(run_dir, files, trees=[run_dir / "output"])
+            runmark.mark_complete(run_dir, run_id=run_id, harness_dir=harness_dir)
+
+        managed.execute(
+            config=self.managed,
+            slot=run_dir,
+            role="rollout",
+            model=model,
+            effort=self.executor["effort"],
+            prompt=prompt,
+            harness_digest=managed.tree_digest(harness_dir),
+            provider=provider,
+            timeout=config.get("timeout") or timeout or self.executor["timeout"],
+            prepare=prepare,
+            binary=self.executor["bin"],
+            finalize=finalize,
+            inputs={
+                "task_id": task_id,
+                "config": config,
+                "source_digest": source_digest,
+                "project": str(self.ctx.project),
+                "revision": revision,
+            },
+        )
+        return run_dir
+
     def _pi_rollout_identity(self, task_id: str, config: dict, harness_digest: str) -> dict:
         prompt = self.task_prompt(task_id)
         if config["workspace"] == "files":
@@ -563,7 +680,10 @@ class GenericAdapter:
         return identity
 
     def artifacts_intact(self, run_dir: Path) -> bool:
-        """Validate a completed Pi rollout before recursion or schedule adopt its cache."""
+        """Validate rollout evidence before recursion or schedule adopt its cache."""
+        if self.managed is not None:
+            # Managed identity and runner state are checked inside execute before reuse.
+            return False
         if self.executor["name"] != "pi":
             return True
         run_dir = Path(run_dir)

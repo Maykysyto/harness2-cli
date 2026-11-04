@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from ..managed import ManagedConfig
 from ..providers import Provider
 from .tree import SurfaceSpec
 
@@ -44,8 +45,14 @@ class ChannelSpec:
     timeout: int = 3600
     bin: str = ""
     provider: Provider | None = None
+    managed: ManagedConfig | None = None
+    role: str = "improver"
 
     def __post_init__(self) -> None:
+        if self.managed is not None and self.kind != "codex":
+            raise ValueError("managed sessions require the Codex channel")
+        if self.managed is not None and self.role not in ("improver", "selector", "reflector"):
+            raise ValueError("managed judge/unknown role is unsupported")
         if self.kind == "claude_cli":
             object.__setattr__(self, "kind", "claude")
         if self.kind not in CHANNELS:

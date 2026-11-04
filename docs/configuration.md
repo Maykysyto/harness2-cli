@@ -277,3 +277,48 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Variables already set in your shell win over `.harness2/.env`.
+
+## Optional managed Codex execution
+
+The `tasks` suite can send every Codex rollout and improver, selector and reflector
+call through an explicitly configured managed runner. This mode is opt-in:
+
+```toml
+[managed]
+runner = ["python3", "/absolute/path/registro/bin/mayky-run"]
+db = "/absolute/path/private/registro.sqlite"
+scope_local = "local-experiment" # alternatively set hilo; exactly one is required
+context = "/absolute/path/context-manifest.json"
+sandbox = "workspace-write" # use "read-only" for a bounded read-only pilot
+```
+
+Configure `executor.name = "codex"` and Codex channels for all three roles.
+Other suites, channels and model judges are rejected. Local task check commands
+remain available. Managed mode builds its own `codex exec --json --ephemeral`
+command with an explicit sandbox. Custom `bin` values accept an executable,
+optionally followed by one existing script path; extra CLI flags are forbidden.
+Provider options and model effort are constructed internally. The configured
+provider home and host environment are inherited; credentials are never copied
+into the workspace or request. `MAYKY_RUN_ID`, when set, is recorded as the
+launching run reference; it grants no authority.
+
+The context file is a ContextManifest v1 JSON object with `version`, `objective`,
+`acceptance`, `repo_revision`, `harness_digest`, `sources`, `tools_available` and
+`skills_available`. References must be nonsecret and should include their
+versions or hashes. Harness2 materializes the manifest, provider description
+and digest into the slot and prompt. Availability does not mean a tool or skill
+was loaded or used.
+
+Each logical call keeps a locked workspace, prompt, request and stable key.
+Repeating unchanged inputs queries the runner with the original request.
+Changing the prompt, model, effort, executable, context, harness or input files
+requires a new run/name. Failures, quota responses and uncertain states stop
+without an automatic retry; inspect their retained evidence before recovery.
+Completed child execution is technical evidence, not acceptance of the task.
+
+Managed role calls return a separate durable harvest snapshot. Replays verify a
+complete inventory of both the snapshot and its source workspace; added, removed
+or changed files stop the call without rebuilding evidence. Harvests must contain
+ordinary files and directories, without symbolic links or special files. Rollout
+output inventories are checked on replay as well. A runner termination reason
+such as timeout or signal prevents completion even when the child exits zero.

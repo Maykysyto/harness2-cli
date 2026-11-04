@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from . import providers
 
 DEFAULTS = {
+    "managed": {},
     "suite": {"name": "tasks", "work": ""},
     "paths": {"harness": ".", "tasks": ".harness2/tasks", "runs": ".harness2/runs"},
     "executor": {
@@ -181,6 +182,10 @@ def _validate(data: dict) -> None:
                 problems.append(
                     f"providers.{name}.type must be one of {', '.join(providers.PROVIDER_TYPES)}"
                 )
+    if data.get("managed"):
+        from .managed import ManagedConfig
+
+        ManagedConfig.from_settings(Settings(None, data, {}))
     if problems:
         raise ConfigError("\n".join(dict.fromkeys(problems)))
 
