@@ -1,5 +1,9 @@
 """Pi workspaces survive interrupted rollouts and model calls."""
 
+import contextlib
+import io
+import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from harness2 import registry, suite
+from harness2.cli.main import main
 from harness2.core import events, recursion, runmark
 from harness2.core.judge import judge_one, judge_selections
 from harness2.core.proposer import Proposer
@@ -42,6 +47,43 @@ class PiWorkflowTests(unittest.TestCase):
         )
         events.start(None)
         self.addCleanup(events.start, None)
+
+    def test_cli_completes_pi_optimization_and_consolidation(self):
+        """Exercise the prompt/recursion boundary, replacing only model transport."""
+        (self.project / ".harness2/config.toml").write_text(
+            '[executor]\nname = "pi"\nmodel = "faux/faux"\n'
+            '[improver]\nchannel = "pi"\nmodel = "faux/faux"\n'
+            "[run]\nphase_width = 1\nproposer_concurrency = 1\n"
+        )
+
+        def host(**kwargs):
+            session = kwargs["session_dir"]
+            session.mkdir(parents=True, exist_ok=True)
+            trajectory = session / "trajectory.jsonl"
+            trajectory.write_text('{"kind":"pi.assistant","model":[]}\n')
+            if kwargs["slot"].startswith("rollout/"):
+                (kwargs["cwd"] / "output/result.txt").write_text("delivered")
+            answer = (
+                "<notes>Keep the supported instructions unchanged.</notes>\n"
+                "<experience>No evidence supporting a harness change.</experience>"
+            )
+            return PiResult(answer, 8, "request", session, trajectory)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config")}),
+            patch("harness2.suite.run_pi_session", side_effect=host),
+            patch("harness2.core.proposer.run_pi_session", side_effect=host),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main(["-C", str(self.project), "--json", "run", "--name", "full"])
+        self.assertEqual(code, 0, stdout.getvalue() + stderr.getvalue())
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(result["result"]["domains"][0]["done"], 1)
+        self.assertEqual(result["totals"]["calls"], 9)
+        final = Path(result["final"]["parallel"]) / "AGENTS.md"
+        self.assertEqual(final.read_text(), "Read the files")
 
     def test_rollout_resumes_the_mutated_workspace_without_completion_marker(self):
         calls = []

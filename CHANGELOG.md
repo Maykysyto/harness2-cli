@@ -6,6 +6,12 @@ All notable changes to Harness² CLI are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Register Pi's instruction and skill surface in optimizer prompts so built-in tasks can
+  complete proposal, composition and consolidation. Reject the unsupported Pi TTS prompt
+  pack explicitly rather than generating instructions for unavailable hooks and subagents.
+
 The first release of Harness² CLI, a general-purpose version of
 [google-research/harness2](https://github.com/google-research/harness2) (forked at
 `1cfe254`). The method and its prompts are unchanged; everything around them is new.

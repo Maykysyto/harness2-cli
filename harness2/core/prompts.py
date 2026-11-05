@@ -730,6 +730,28 @@ Change only what a trajectory shows needs changing. Text the agent reads on ever
 for on every run, competing with the agent's own work: if you add some, cut something else."""
 
 
+_SURFACE_PI_HEAD = """\
+# WHAT YOU CAN CHANGE
+
+This Pi Durable SDK host loads only the following editable harness components:
+
+| path | component | when it is in context |
+|---|---|---|
+| `AGENTS.md` | standing instructions | injected whole into every session; capped at 8000 characters |
+| `.agents/skills/<name>/SKILL.md` | reusable workflow | name and description listed; body read ON DEMAND |
+| `.agents/skills/<name>/scripts/*` | a helper carried with its skill | run on demand through Code Mode |
+| `.agents/scripts/<name>.py` | deterministic helper | run on demand through Code Mode |
+
+A skill needs YAML frontmatter with a `description:` describing when it applies. Its name
+defaults to its directory. The runtime lists skills automatically; no trigger line in
+AGENTS.md is required. Every referenced helper must ship at one of the allowed paths.
+
+The host provides coding tools through Code Mode. Personal Pi CLI extensions, hooks, MCP
+servers and delegated subagent definitions are not loaded or part of this editable surface.
+Use skills and scripts for procedures; keep always-on instructions short. Change only what
+the observed trajectories support, and preserve the deliverable shape the task requested."""
+
+
 @dataclass(frozen=True)
 class _SurfaceText:
     """The per-substrate prompt fragments, resolved once at module load."""
@@ -786,7 +808,25 @@ def _build_surface_texts() -> dict[str, _SurfaceText]:
         ]
     )
     command_md = "\n\n".join([_SURFACE_COMMAND_HEAD, shape_and_how])
+    pi_md = "\n\n".join([_SURFACE_PI_HEAD, shape_and_how])
     return {
+        "pi": _SurfaceText(
+            surface_md=pi_md,
+            inv=_levers(
+                _INV_TEMPLATE,
+                script_lever="`.agents/scripts/<name>.py`",
+                skill_lever="use an on-demand skill for a narrow multi-step procedure, describe\n"
+                "  its trigger in its frontmatter, and carry any helper it requires.",
+                loop_lever="explicit check through Code Mode; this SDK host has no editable hooks",
+            ),
+            dom=_levers(
+                _DOM_TEMPLATE,
+                trigger_sentence="The runtime advertises skills by description: describe the "
+                "situation the skill handles in its frontmatter.",
+            ),
+            tts_surface=pi_md,
+            script_dir=".agents/scripts",
+        ),
         "opencode": _SurfaceText(
             surface_md=_SURFACE_OPENCODE,
             inv=_levers(
@@ -861,8 +901,10 @@ def _build_surface_texts() -> dict[str, _SurfaceText]:
 _SURFACE_TEXTS = _build_surface_texts()
 
 
-def _st(surface: SurfaceSpec | str) -> _SurfaceText:
+def _st(surface: SurfaceSpec | str, *, prompt_pack: str = "adapt") -> _SurfaceText:
     name = surface if isinstance(surface, str) else surface.name
+    if name == "pi" and prompt_pack == "tts":
+        raise ValueError("Pi supports the built-in tasks prompt pack; TTS is not supported")
     got = _SURFACE_TEXTS.get(name)
     if got is None:
         raise ValueError(f"no prompt surface for {name!r}; known: {sorted(_SURFACE_TEXTS)}")
@@ -1039,7 +1081,7 @@ def propose(
     """The job for one INV or DOM candidate. `round_t` set => sequential mode, pass t."""
     if dim not in ("INV", "DOM"):
         raise ValueError(f"unknown proposal dimension {dim!r}; expected 'INV' or 'DOM'")
-    st = _st(surface)
+    st = _st(surface, prompt_pack=bp.prompt_pack)
 
     if bp.prompt_pack == "tts" and round_t is None:
         return _tts_propose(bp, dim, st, k=k, index=index)
@@ -1098,7 +1140,7 @@ def propose(
 
 def aggregate(bp: BenchPrompts, surface: SurfaceSpec | str, *, k: int = 1, index: int = 1) -> str:
     """agg-k: compose ONE final from all base evidence and all 2k candidates."""
-    st = _st(surface)
+    st = _st(surface, prompt_pack=bp.prompt_pack)
     if bp.prompt_pack == "tts":
         return _tts_aggregate(bp, st, k=k, index=index)
     n = 2 * k
@@ -1169,7 +1211,7 @@ def aggregate(bp: BenchPrompts, surface: SurfaceSpec | str, *, k: int = 1, index
 
 def compose_round(bp: BenchPrompts, surface: SurfaceSpec | str, *, t: int, k: int) -> str:
     """seq-k: compose checkpoint C_t from this round's candidates and every earlier round."""
-    st = _st(surface)
+    st = _st(surface, prompt_pack=bp.prompt_pack)
     final = t >= k
     return _tidy(
         "\n\n".join(

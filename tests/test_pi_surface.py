@@ -4,10 +4,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from harness2.core import prompts
+from harness2.core.spec import BenchPrompts
 from harness2.substrate.pi import PiSubstrate
 
 
 class PiSurfaceTests(unittest.TestCase):
+    def test_tts_pack_is_rejected_before_unsupported_pi_prompts_are_generated(self):
+        bp = BenchPrompts(work="Fix Python files", prompt_pack="tts")
+        surface = PiSubstrate().surface()
+        for dimension in ("INV", "DOM"):
+            with self.subTest(dimension=dimension):
+                with self.assertRaisesRegex(ValueError, "Pi.*TTS"):
+                    prompts.propose(bp, dimension, surface)
+        with self.assertRaisesRegex(ValueError, "Pi.*TTS"):
+            prompts.aggregate(bp, surface)
+        with self.assertRaisesRegex(ValueError, "Pi.*TTS"):
+            prompts.compose_round(bp, surface, t=1, k=1)
+
     def test_import_export_keeps_instructions_and_skills_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
